@@ -67,6 +67,7 @@ pub fn ptr_to_addr(name: &str) -> Result<String, PtrParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::net::IpAddr;
 
     #[test]
@@ -84,19 +85,42 @@ mod tests {
         assert_eq!(ip, expected);
     }
 
+    #[rstest]
+    #[case::not_reverse_dns("example.com.")]
+    #[case::too_few_octets("1.2.3.in-addr.arpa.")]
+    #[case::non_numeric_octets("x.y.z.w.in-addr.arpa.")]
+    fn test_ptr_to_addr_invalid(#[case] input: &str) {
+        assert!(
+            ptr_to_addr(input).is_err(),
+            "expected error for {:?}, got Ok",
+            input
+        );
+    }
+
     #[test]
-    fn test_ptr_to_addr_invalid() {
-        let cases = vec![
-            "example.com.",
-            "1.2.3.in-addr.arpa.",
-            "x.y.z.w.in-addr.arpa.",
-        ];
-        for c in cases {
-            assert!(
-                ptr_to_addr(c).is_err(),
-                "expected error for {:?}, got Ok",
-                c
-            );
-        }
+    fn test_ptr_to_addr_ipv6_wrong_nibble_count() {
+        // Too few nibbles (only 16 instead of 32).
+        let short = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.";
+        assert!(
+            ptr_to_addr(short).is_err(),
+            "expected error for truncated IPv6 PTR name"
+        );
+    }
+
+    #[test]
+    fn test_ptr_to_addr_ipv6_invalid_nibbles() {
+        // 32 nibbles but contains 'z' which is not a valid hex nibble.
+        let bad = "z.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.";
+        assert!(
+            ptr_to_addr(bad).is_err(),
+            "expected error for invalid hex nibbles in IPv6 PTR name"
+        );
+    }
+
+    #[test]
+    fn test_ptr_to_addr_no_trailing_dot() {
+        // IPv4 PTR without trailing dot should still work.
+        let addr = ptr_to_addr("34.216.184.93.in-addr.arpa").unwrap();
+        assert_eq!(addr, "93.184.216.34");
     }
 }

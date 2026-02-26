@@ -44,9 +44,7 @@ async fn main() -> Result<()> {
     let (udp_socket, tcp_listener) = wait_for_bind(&listen_addr).await?;
 
     tracing::info!("listening on {} (UDP and TCP)", listen_addr);
-    tracing::info!(
-        "using system resolver for A, AAAA, CNAME, MX, TXT, SRV, NS, PTR queries"
-    );
+    tracing::info!("using system resolver for A, AAAA, CNAME, MX, TXT, SRV, NS, PTR queries");
     tracing::info!("fallback upstream {} for other query types", cli.upstream);
 
     // Launch UDP and TCP servers concurrently, shut down on signal.
@@ -81,7 +79,10 @@ async fn run_udp_server(
 
     let mut buf = vec![0u8; 4096];
     loop {
-        let (len, src) = socket.recv_from(&mut buf).await.context("UDP recv failed")?;
+        let (len, src) = socket
+            .recv_from(&mut buf)
+            .await
+            .context("UDP recv failed")?;
 
         let request = match Message::from_vec(&buf[..len]) {
             Ok(msg) => msg,
@@ -127,9 +128,7 @@ async fn run_tcp_server(
         let resolver = resolver.clone();
         let upstream = upstream.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_tcp_connection(stream, src, resolver, upstream, verbose).await
-            {
+            if let Err(e) = handle_tcp_connection(stream, src, resolver, upstream, verbose).await {
                 tracing::debug!("TCP connection from {} error: {}", src, e);
             }
         });
@@ -165,7 +164,9 @@ async fn handle_tcp_connection(
     let response =
         handler::handle_dns(&request, resolver.as_ref(), &upstream, "tcp", src, verbose).await;
 
-    let response_bytes = response.to_vec().context("failed to serialize TCP response")?;
+    let response_bytes = response
+        .to_vec()
+        .context("failed to serialize TCP response")?;
 
     // Write 2-byte length prefix + response.
     let len_prefix = (response_bytes.len() as u16).to_be_bytes();
@@ -185,17 +186,13 @@ async fn wait_for_bind(addr: &str) -> Result<(UdpSocket, TcpListener)> {
     let mut logged_waiting = false;
 
     loop {
-        match UdpSocket::bind(addr).await {
-            Ok(udp) => match TcpListener::bind(addr).await {
-                Ok(tcp) => {
-                    if logged_waiting {
-                        tracing::info!("interface {} is now available, listening", addr);
-                    }
-                    return Ok((udp, tcp));
-                }
-                Err(_) => {}
-            },
-            Err(_) => {}
+        if let Ok(udp) = UdpSocket::bind(addr).await
+            && let Ok(tcp) = TcpListener::bind(addr).await
+        {
+            if logged_waiting {
+                tracing::info!("interface {} is now available, listening", addr);
+            }
+            return Ok((udp, tcp));
         }
 
         if !logged_waiting {
@@ -223,9 +220,8 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to register SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
         tokio::select! {
             _ = ctrl_c => {},
             _ = sigterm.recv() => {},

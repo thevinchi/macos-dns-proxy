@@ -15,7 +15,9 @@ pub async fn forward_upstream(
     upstream: &str,
     protocol: &str,
 ) -> Result<Message> {
-    let request_bytes = request.to_vec().context("failed to serialize DNS request")?;
+    let request_bytes = request
+        .to_vec()
+        .context("failed to serialize DNS request")?;
 
     match protocol {
         "udp" => forward_udp(&request_bytes, upstream).await,

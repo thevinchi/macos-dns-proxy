@@ -28,7 +28,10 @@ impl std::error::Error for ResolveError {}
 /// swapped with a mock in tests.
 pub trait Resolver: Send + Sync {
     /// Resolve A/AAAA records via getaddrinfo. Returns IP addresses.
-    fn lookup_host(&self, name: &str) -> impl std::future::Future<Output = Result<Vec<IpAddr>, ResolveError>> + Send;
+    fn lookup_host(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<IpAddr>, ResolveError>> + Send;
 
     /// Query specific DNS record types via the system resolver (res_query).
     /// Used for CNAME, MX, TXT, SRV, NS, PTR queries.

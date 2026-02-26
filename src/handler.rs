@@ -5,7 +5,7 @@ use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 
-use crate::resolver::{is_supported_by_system_resolver, ResolveError, Resolver};
+use crate::resolver::{ResolveError, Resolver, is_supported_by_system_resolver};
 use crate::upstream;
 
 /// Default TTL for records resolved via getaddrinfo (which doesn't expose TTLs).
@@ -33,13 +33,13 @@ pub async fn handle_dns<R: Resolver>(
     let start = Instant::now();
 
     let result = match qtype {
-        RecordType::A | RecordType::AAAA => {
-            resolve_host(resolver, request, &qname, qtype).await
-        }
-        RecordType::CNAME | RecordType::MX | RecordType::TXT | RecordType::SRV
-        | RecordType::NS | RecordType::PTR => {
-            resolve_via_system(resolver, request, &qname, qtype).await
-        }
+        RecordType::A | RecordType::AAAA => resolve_host(resolver, request, &qname, qtype).await,
+        RecordType::CNAME
+        | RecordType::MX
+        | RecordType::TXT
+        | RecordType::SRV
+        | RecordType::NS
+        | RecordType::PTR => resolve_via_system(resolver, request, &qname, qtype).await,
         _ => upstream::forward_upstream(request, upstream_addr, protocol)
             .await
             .map_err(|e| ResolveError::Failed(e.to_string())),

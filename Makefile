@@ -5,18 +5,30 @@ INSTALL_BIN := /usr/local/bin/$(BINARY)
 LOG_FILE  := /var/log/macos-dns-proxy.log
 BUILD_DIR := /tmp/$(BINARY)-build
 
-.PHONY: build test clean install uninstall status logs
+.PHONY: build test test-cargo lint coverage clean install uninstall status logs
 
 build:
 	cargo build --release
 	cp target/release/$(BINARY) ./$(BINARY)
 
 test:
+	cargo nextest run
+
+test-cargo:
 	cargo test
+
+lint:
+	cargo fmt --check
+	cargo clippy -- -D warnings
+
+coverage:
+	cargo llvm-cov nextest --html --output-dir coverage
+	@echo "Coverage report: coverage/html/index.html"
 
 clean:
 	cargo clean
 	rm -f $(BINARY)
+	rm -rf coverage
 
 install:
 ifndef LISTEN
