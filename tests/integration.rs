@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
-use hickory_proto::rr::rdata::{A, CNAME, MX, NS, SOA, SRV, TXT};
+use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, NS, PTR as PtrRData, SOA, SRV, TXT};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -64,6 +64,26 @@ impl Resolver for MockResolver {
             .get(&(name.to_string(), record_type))
             .cloned()
             .ok_or(ResolveError::NotFound)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FailingMockResolver -- always returns ResolveError::Failed
+// ---------------------------------------------------------------------------
+
+struct FailingMockResolver;
+
+impl Resolver for FailingMockResolver {
+    async fn lookup_host(&self, _name: &str) -> Result<Vec<IpAddr>, ResolveError> {
+        Err(ResolveError::Failed("mock resolver failure".to_string()))
+    }
+
+    async fn query_records(
+        &self,
+        _name: &str,
+        _record_type: RecordType,
+    ) -> Result<Vec<Record>, ResolveError> {
+        Err(ResolveError::Failed("mock resolver failure".to_string()))
     }
 }
 
@@ -155,6 +175,18 @@ fn full_mock_resolver() -> MockResolver {
                 5060,
                 Name::from_ascii("sip.example.com.").unwrap(),
             )),
+        )],
+    );
+
+    // PTR record (reverse lookup for 93.184.216.34)
+    let ptr_name = Name::from_ascii("34.216.184.93.in-addr.arpa.").unwrap();
+    resolver.add_records(
+        "34.216.184.93.in-addr.arpa",
+        RecordType::PTR,
+        vec![Record::from_rdata(
+            ptr_name,
+            60,
+            RData::PTR(PtrRData(Name::from_ascii("example.com.").unwrap())),
         )],
     );
 
@@ -837,4 +869,403 @@ async fn test_empty_question() {
         "expected error rcode for empty question, got {:?}",
         resp.response_code()
     );
+}
+
+// ---------------------------------------------------------------------------
+// CNAME / SRV / PTR Tests (via handler)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_system_resolver_cname() {
+    let resolver = Arc::new(full_mock_resolver());
+    let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
+
+    let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::CNAME).await;
+
+    assert_eq!(
+        resp.response_code(),
+        ResponseCode::NoError,
+        "expected NOERROR"
+    );
+    assert!(!resp.answers().is_empty(), "expected at least one answer");
+
+    let rdata = resp.answers()[0].data();
+    match rdata {
+        RData::CNAME(cname) => {
+            assert_eq!(
+                cname.0.to_ascii(),
+                "alias.example.com.",
+                "unexpected CNAME target"
+            );
+        }
+        other => panic!("expected CNAME record, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_system_resolver_srv() {
+    let resolver = Arc::new(full_mock_resolver());
+    let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
+
+    let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::SRV).await;
+
+    assert_eq!(
+        resp.response_code(),
+        ResponseCode::NoError,
+        "expected NOERROR"
+    );
+    assert!(!resp.answers().is_empty(), "expected at least one answer");
+
+    let rdata = resp.answers()[0].data();
+    match rdata {
+        RData::SRV(srv) => {
+            assert_eq!(srv.priority(), 10, "unexpected SRV priority");
+            assert_eq!(srv.weight(), 5, "unexpected SRV weight");
+            assert_eq!(srv.port(), 5060, "unexpected SRV port");
+            assert_eq!(
+                srv.target().to_ascii(),
+                "sip.example.com.",
+                "unexpected SRV target"
+            );
+        }
+        other => panic!("expected SRV record, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_system_resolver_ptr() {
+    let resolver = Arc::new(full_mock_resolver());
+    let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
+
+    let resp = query_proxy(
+        proxy_addr,
+        "udp",
+        "34.216.184.93.in-addr.arpa.",
+        RecordType::PTR,
+    )
+    .await;
+
+    assert_eq!(
+        resp.response_code(),
+        ResponseCode::NoError,
+        "expected NOERROR"
+    );
+    assert!(!resp.answers().is_empty(), "expected at least one answer");
+
+    let rdata = resp.answers()[0].data();
+    match rdata {
+        RData::PTR(ptr) => {
+            assert_eq!(
+                ptr.0.to_ascii(),
+                "example.com.",
+                "unexpected PTR target"
+            );
+        }
+        other => panic!("expected PTR record, got {:?}", other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Address Filtering Tests
+// ---------------------------------------------------------------------------
+
+/// A query for a host with both IPv4 and IPv6 should only return IPv4 answers.
+#[tokio::test]
+async fn test_a_query_filters_ipv6() {
+    let resolver = Arc::new(full_mock_resolver());
+    let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
+
+    let resp = query_proxy(proxy_addr, "udp", "example-both.com.", RecordType::A).await;
+
+    assert_eq!(
+        resp.response_code(),
+        ResponseCode::NoError,
+        "expected NOERROR"
+    );
+    assert!(!resp.answers().is_empty(), "expected at least one answer");
+
+    for answer in resp.answers() {
+        match answer.data() {
+            RData::A(_) => {} // expected
+            other => panic!("A query should not return non-A records, got {:?}", other),
+        }
+    }
+    // Verify the IPv4 address is correct.
+    match resp.answers()[0].data() {
+        RData::A(a) => assert_eq!(a.0, Ipv4Addr::new(93, 184, 216, 34)),
+        _ => unreachable!(),
+    }
+}
+
+/// AAAA query for a host with both IPv4 and IPv6 should only return IPv6 answers.
+#[tokio::test]
+async fn test_aaaa_query_filters_ipv4() {
+    let resolver = Arc::new(full_mock_resolver());
+    let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
+
+    let resp = query_proxy(proxy_addr, "udp", "example-both.com.", RecordType::AAAA).await;
+
+    assert_eq!(
+        resp.response_code(),
+        ResponseCode::NoError,
+        "expected NOERROR"
+    );
+    assert!(!resp.answers().is_empty(), "expected at least one answer");
+
+    for answer in resp.answers() {
+        match answer.data() {
+            RData::AAAA(_) => {} // expected
+            other => panic!(
+                "AAAA query should not return non-AAAA records, got {:?}",
+                other
+            ),
+        }
+    }
+    // Verify the IPv6 address is correct.
+    match resp.answers()[0].data() {
+        RData::AAAA(aaaa) => {
+            let expected: Ipv6Addr = "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap();
+            assert_eq!(aaaa.0, expected);
+        }
+        _ => unreachable!(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NXDOMAIN Tests
+// ---------------------------------------------------------------------------
+
+/// A query for a nonexistent domain should return NXDOMAIN.
+#[tokio::test]
+async fn test_nxdomain_a() {
+    let resolver = Arc::new(full_mock_resolver());
+    let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
+
+    let resp = query_proxy(
+        proxy_addr,
+        "udp",
+        "nonexistent.example.com.",
+        RecordType::A,
+    )
+    .await;
+
+    assert_eq!(
+        resp.response_code(),
+        ResponseCode::NXDomain,
+        "expected NXDOMAIN for nonexistent A query"
+    );
+    assert!(resp.answers().is_empty(), "expected no answers");
+}
+
+/// AAAA query for a nonexistent domain should return NXDOMAIN.
+#[tokio::test]
+async fn test_nxdomain_aaaa() {
+    let resolver = Arc::new(full_mock_resolver());
+    let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
+
+    let resp = query_proxy(
+        proxy_addr,
+        "udp",
+        "nonexistent.example.com.",
+        RecordType::AAAA,
+    )
+    .await;
+
+    assert_eq!(
+        resp.response_code(),
+        ResponseCode::NXDomain,
+        "expected NXDOMAIN for nonexistent AAAA query"
+    );
+    assert!(resp.answers().is_empty(), "expected no answers");
+}
+
+/// MX query for a nonexistent domain should return NXDOMAIN.
+#[tokio::test]
+async fn test_nxdomain_mx() {
+    let resolver = Arc::new(full_mock_resolver());
+    let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
+
+    let resp = query_proxy(
+        proxy_addr,
+        "udp",
+        "nonexistent.example.com.",
+        RecordType::MX,
+    )
+    .await;
+
+    assert_eq!(
+        resp.response_code(),
+        ResponseCode::NXDomain,
+        "expected NXDOMAIN for nonexistent MX query"
+    );
+    assert!(resp.answers().is_empty(), "expected no answers");
+}
+
+/// TXT query for a nonexistent domain should return NXDOMAIN.
+#[tokio::test]
+async fn test_nxdomain_txt() {
+    let resolver = Arc::new(full_mock_resolver());
+    let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
+
+    let resp = query_proxy(
+        proxy_addr,
+        "udp",
+        "nonexistent.example.com.",
+        RecordType::TXT,
+    )
+    .await;
+
+    assert_eq!(
+        resp.response_code(),
+        ResponseCode::NXDomain,
+        "expected NXDOMAIN for nonexistent TXT query"
+    );
+    assert!(resp.answers().is_empty(), "expected no answers");
+}
+
+// ---------------------------------------------------------------------------
+// Resolver Error Tests
+// ---------------------------------------------------------------------------
+
+/// When the resolver returns Failed (not NotFound), the handler should
+/// return SERVFAIL.
+#[tokio::test]
+async fn test_resolver_failed_returns_servfail_a() {
+    let resolver = Arc::new(FailingMockResolver);
+    let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
+
+    let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::A).await;
+
+    assert_eq!(
+        resp.response_code(),
+        ResponseCode::ServFail,
+        "expected SERVFAIL when resolver returns Failed"
+    );
+}
+
+/// When the resolver returns Failed for a record type query (MX, TXT, etc.),
+/// the handler should return SERVFAIL.
+#[tokio::test]
+async fn test_resolver_failed_returns_servfail_mx() {
+    let resolver = Arc::new(FailingMockResolver);
+    let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
+
+    let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::MX).await;
+
+    assert_eq!(
+        resp.response_code(),
+        ResponseCode::ServFail,
+        "expected SERVFAIL when resolver returns Failed for MX"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TCP Upstream Fallback Tests
+// ---------------------------------------------------------------------------
+
+/// TCP variant of unreachable upstream -- SOA query via TCP to a dead
+/// upstream should return SERVFAIL.
+#[tokio::test]
+async fn test_unreachable_upstream_tcp() {
+    let dead_upstream = "127.0.0.1:59999";
+    let resolver = Arc::new(MockResolver::new());
+    let (proxy_addr, _proxy_handle) = start_tcp_proxy(resolver, dead_upstream, false).await;
+
+    let resp = query_proxy_with_timeout(
+        proxy_addr,
+        "tcp",
+        "example.com.",
+        RecordType::SOA,
+        Duration::from_secs(10),
+    )
+    .await;
+
+    assert_eq!(
+        resp.response_code(),
+        ResponseCode::ServFail,
+        "expected SERVFAIL for unreachable TCP upstream"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Direct Upstream Tests
+// ---------------------------------------------------------------------------
+
+/// forward_upstream with an unknown protocol should return an error.
+#[tokio::test]
+async fn test_forward_upstream_unknown_protocol() {
+    let mut msg = Message::new();
+    msg.set_id(rand::random());
+
+    let result =
+        macos_dns_proxy::upstream::forward_upstream(&msg, "127.0.0.1:53", "sctp").await;
+
+    assert!(result.is_err(), "expected error for unknown protocol");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("unsupported protocol"),
+        "expected 'unsupported protocol' error, got: {}",
+        err_msg
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Additional PTR Parsing Edge Cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_ptr_to_addr_ipv6_wrong_nibble_count() {
+    // Too few nibbles (only 16 instead of 32).
+    let short = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.";
+    assert!(
+        macos_dns_proxy::ptr::ptr_to_addr(short).is_err(),
+        "expected error for truncated IPv6 PTR name"
+    );
+}
+
+#[test]
+fn test_ptr_to_addr_ipv6_invalid_nibbles() {
+    // 32 nibbles but contains 'z' which is not a valid hex nibble.
+    let bad = "z.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.";
+    assert!(
+        macos_dns_proxy::ptr::ptr_to_addr(bad).is_err(),
+        "expected error for invalid hex nibbles in IPv6 PTR name"
+    );
+}
+
+#[test]
+fn test_ptr_to_addr_no_trailing_dot() {
+    // IPv4 PTR without trailing dot should still work.
+    let addr = macos_dns_proxy::ptr::ptr_to_addr("34.216.184.93.in-addr.arpa").unwrap();
+    assert_eq!(addr, "93.184.216.34");
+}
+
+// ---------------------------------------------------------------------------
+// Verbose Logging Coverage (additional paths)
+// ---------------------------------------------------------------------------
+
+/// Verbose logging for NXDOMAIN response (error branch in verbose output).
+#[tokio::test]
+async fn test_verbose_logging_nxdomain() {
+    let resolver = Arc::new(full_mock_resolver());
+    let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", true).await;
+
+    let resp = query_proxy(
+        proxy_addr,
+        "udp",
+        "nonexistent.example.com.",
+        RecordType::A,
+    )
+    .await;
+    assert_eq!(resp.response_code(), ResponseCode::NXDomain);
+}
+
+/// Verbose logging for a resolver failure (error branch in verbose output).
+#[tokio::test]
+async fn test_verbose_logging_resolver_failure() {
+    let resolver = Arc::new(FailingMockResolver);
+    let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", true).await;
+
+    let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::A).await;
+    assert_eq!(resp.response_code(), ResponseCode::ServFail);
 }

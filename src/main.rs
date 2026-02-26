@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -40,8 +41,9 @@ async fn main() -> Result<()> {
     let verbose = cli.verbose;
     let resolver = Arc::new(SystemResolver);
 
-    tracing::info!("starting UDP listener on {}", listen_addr);
-    tracing::info!("starting TCP listener on {}", listen_addr);
+    let (udp_socket, tcp_listener) = wait_for_bind(&listen_addr).await?;
+
+    tracing::info!("listening on {} (UDP and TCP)", listen_addr);
     tracing::info!(
         "using system resolver for A, AAAA, CNAME, MX, TXT, SRV, NS, PTR queries"
     );
@@ -49,12 +51,12 @@ async fn main() -> Result<()> {
 
     // Launch UDP and TCP servers concurrently, shut down on signal.
     tokio::select! {
-        result = run_udp_server(&listen_addr, resolver.clone(), upstream.clone(), verbose) => {
+        result = run_udp_server(udp_socket, resolver.clone(), upstream.clone(), verbose) => {
             if let Err(e) = result {
                 tracing::error!("UDP server failed: {}", e);
             }
         },
-        result = run_tcp_server(&listen_addr, resolver.clone(), upstream.clone(), verbose) => {
+        result = run_tcp_server(tcp_listener, resolver.clone(), upstream.clone(), verbose) => {
             if let Err(e) = result {
                 tracing::error!("TCP server failed: {}", e);
             }
@@ -70,16 +72,12 @@ async fn main() -> Result<()> {
 
 /// Run the UDP DNS server loop.
 async fn run_udp_server(
-    addr: &str,
+    socket: UdpSocket,
     resolver: Arc<SystemResolver>,
     upstream: Arc<String>,
     verbose: bool,
 ) -> Result<()> {
-    let socket = Arc::new(
-        UdpSocket::bind(addr)
-            .await
-            .with_context(|| format!("failed to bind UDP on {}", addr))?,
-    );
+    let socket = Arc::new(socket);
 
     let mut buf = vec![0u8; 4096];
     loop {
@@ -118,15 +116,11 @@ async fn run_udp_server(
 
 /// Run the TCP DNS server loop.
 async fn run_tcp_server(
-    addr: &str,
+    listener: TcpListener,
     resolver: Arc<SystemResolver>,
     upstream: Arc<String>,
     verbose: bool,
 ) -> Result<()> {
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind TCP on {}", addr))?;
-
     loop {
         let (stream, src) = listener.accept().await.context("TCP accept failed")?;
 
@@ -179,6 +173,48 @@ async fn handle_tcp_connection(
     stream.write_all(&response_bytes).await?;
 
     Ok(())
+}
+
+/// Wait for the listen address to become available, retrying with backoff.
+///
+/// Logs once on the first bind failure, then retries silently. Logs again
+/// when the interface appears and binding succeeds.
+async fn wait_for_bind(addr: &str) -> Result<(UdpSocket, TcpListener)> {
+    let mut delay = Duration::from_secs(1);
+    let max_delay = Duration::from_secs(30);
+    let mut logged_waiting = false;
+
+    loop {
+        match UdpSocket::bind(addr).await {
+            Ok(udp) => match TcpListener::bind(addr).await {
+                Ok(tcp) => {
+                    if logged_waiting {
+                        tracing::info!("interface {} is now available, listening", addr);
+                    }
+                    return Ok((udp, tcp));
+                }
+                Err(_) => {}
+            },
+            Err(_) => {}
+        }
+
+        if !logged_waiting {
+            tracing::warn!(
+                "interface {} not available, will retry until it appears",
+                addr
+            );
+            logged_waiting = true;
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {},
+            _ = shutdown_signal() => {
+                anyhow::bail!("received shutdown signal while waiting for interface {}", addr);
+            },
+        }
+
+        delay = (delay * 2).min(max_delay);
+    }
 }
 
 /// Wait for SIGINT (ctrl-c) or SIGTERM shutdown signal.
