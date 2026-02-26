@@ -3,6 +3,7 @@ PLIST_SRC := com.local.macos-dns-proxy.plist
 PLIST_DST := /Library/LaunchDaemons/com.local.macos-dns-proxy.plist
 INSTALL_BIN := /usr/local/bin/$(BINARY)
 LOG_FILE  := /var/log/macos-dns-proxy.log
+BUILD_DIR := /tmp/$(BINARY)-build
 
 .PHONY: build test clean install uninstall status logs
 
@@ -17,7 +18,7 @@ clean:
 	cargo clean
 	rm -f $(BINARY)
 
-install: build
+install:
 ifndef LISTEN
 	@printf "Listen address (e.g., 192.168.99.1:53): "; \
 	read LISTEN_ADDR; \
@@ -29,13 +30,15 @@ ifndef LISTEN
 else
 	@sed "s|LISTEN_ADDR|$(LISTEN)|g" $(PLIST_SRC) > /tmp/$(PLIST_SRC)
 endif
-	sudo cp $(BINARY) $(INSTALL_BIN)
+	CARGO_TARGET_DIR=$(BUILD_DIR) cargo build --release
+	sudo cp $(BUILD_DIR)/release/$(BINARY) $(INSTALL_BIN)
 	sudo chmod 755 $(INSTALL_BIN)
 	sudo cp /tmp/$(PLIST_SRC) $(PLIST_DST)
 	sudo chmod 644 $(PLIST_DST)
 	sudo launchctl bootout system/com.local.macos-dns-proxy 2>/dev/null || true
 	sudo launchctl bootstrap system $(PLIST_DST)
 	@rm -f /tmp/$(PLIST_SRC)
+	@rm -rf $(BUILD_DIR)
 	@echo ""
 	@echo "$(BINARY) installed and running."
 	@echo "  Binary:  $(INSTALL_BIN)"
