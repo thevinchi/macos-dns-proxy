@@ -1,0 +1,20 @@
+# Rust build output
+target/
+
+# Compiled binary (produced by `make build`)
+macos-dns-proxy
+
+# Editor and IDE files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.iml
+
+# macOS
+.DS_Store
+
+# Backup files
+*.bak
+*.orig
