@@ -12,10 +12,8 @@ build:
 	cp target/release/$(BINARY) ./$(BINARY)
 
 test:
+	@command -v cargo-nextest >/dev/null 2>&1 || { echo "Installing cargo-nextest..."; cargo install cargo-nextest --locked; }
 	cargo nextest run
-
-test-cargo:
-	cargo test
 
 lint:
 	cargo fmt --check
