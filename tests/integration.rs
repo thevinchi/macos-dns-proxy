@@ -9,7 +9,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
 use hickory_proto::rr::rdata::{A, CNAME, MX, NS, SOA, SRV, TXT};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
@@ -46,7 +45,6 @@ impl MockResolver {
     }
 }
 
-#[async_trait]
 impl Resolver for MockResolver {
     async fn lookup_host(&self, name: &str) -> Result<Vec<IpAddr>, ResolveError> {
         let name = name.trim_end_matches('.');
@@ -306,7 +304,7 @@ async fn start_mock_tcp_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) 
 
 /// Start a UDP proxy server with the given resolver and upstream.
 async fn start_proxy(
-    resolver: Arc<dyn Resolver>,
+    resolver: Arc<MockResolver>,
     upstream_addr: &str,
     verbose: bool,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -348,7 +346,7 @@ async fn start_proxy(
 
 /// Start a TCP proxy server.
 async fn start_tcp_proxy(
-    resolver: Arc<dyn Resolver>,
+    resolver: Arc<MockResolver>,
     upstream_addr: &str,
     verbose: bool,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -480,7 +478,7 @@ async fn query_proxy(
 /// Port of Go TestSystemResolverA
 #[tokio::test]
 async fn test_system_resolver_a() {
-    let resolver = Arc::new(full_mock_resolver()) as Arc<dyn Resolver>;
+    let resolver = Arc::new(full_mock_resolver());
     let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::A).await;
@@ -492,7 +490,7 @@ async fn test_system_resolver_a() {
     );
     assert!(!resp.answers().is_empty(), "expected at least one answer");
 
-    let rdata = resp.answers()[0].data().expect("record should have data");
+    let rdata = resp.answers()[0].data();
     match rdata {
         RData::A(a) => assert_eq!(a.0, Ipv4Addr::new(93, 184, 216, 34)),
         other => panic!("expected A record, got {:?}", other),
@@ -510,7 +508,7 @@ async fn test_system_resolver_aaaa() {
             "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap(),
         )],
     );
-    let resolver = Arc::new(resolver) as Arc<dyn Resolver>;
+    let resolver = Arc::new(resolver);
     let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::AAAA).await;
@@ -522,7 +520,7 @@ async fn test_system_resolver_aaaa() {
     );
     assert!(!resp.answers().is_empty(), "expected at least one answer");
 
-    let rdata = resp.answers()[0].data().expect("record should have data");
+    let rdata = resp.answers()[0].data();
     match rdata {
         RData::AAAA(aaaa) => {
             let expected: Ipv6Addr = "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap();
@@ -535,7 +533,7 @@ async fn test_system_resolver_aaaa() {
 /// Port of Go TestSystemResolverMX
 #[tokio::test]
 async fn test_system_resolver_mx() {
-    let resolver = Arc::new(full_mock_resolver()) as Arc<dyn Resolver>;
+    let resolver = Arc::new(full_mock_resolver());
     let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::MX).await;
@@ -547,7 +545,7 @@ async fn test_system_resolver_mx() {
     );
     assert!(!resp.answers().is_empty(), "expected at least one answer");
 
-    let rdata = resp.answers()[0].data().expect("record should have data");
+    let rdata = resp.answers()[0].data();
     match rdata {
         RData::MX(mx) => {
             assert_eq!(
@@ -564,7 +562,7 @@ async fn test_system_resolver_mx() {
 /// Port of Go TestSystemResolverTXT
 #[tokio::test]
 async fn test_system_resolver_txt() {
-    let resolver = Arc::new(full_mock_resolver()) as Arc<dyn Resolver>;
+    let resolver = Arc::new(full_mock_resolver());
     let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::TXT).await;
@@ -576,7 +574,7 @@ async fn test_system_resolver_txt() {
     );
     assert!(!resp.answers().is_empty(), "expected at least one answer");
 
-    let rdata = resp.answers()[0].data().expect("record should have data");
+    let rdata = resp.answers()[0].data();
     match rdata {
         RData::TXT(txt) => {
             let txt_data: Vec<String> = txt
@@ -596,7 +594,7 @@ async fn test_system_resolver_txt() {
 /// Port of Go TestSystemResolverNS
 #[tokio::test]
 async fn test_system_resolver_ns() {
-    let resolver = Arc::new(full_mock_resolver()) as Arc<dyn Resolver>;
+    let resolver = Arc::new(full_mock_resolver());
     let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::NS).await;
@@ -608,7 +606,7 @@ async fn test_system_resolver_ns() {
     );
     assert!(!resp.answers().is_empty(), "expected at least one answer");
 
-    let rdata = resp.answers()[0].data().expect("record should have data");
+    let rdata = resp.answers()[0].data();
     match rdata {
         RData::NS(ns) => {
             assert_eq!(ns.0.to_ascii(), "ns1.example.com.", "unexpected NS value");
@@ -627,7 +625,7 @@ async fn test_upstream_fallback_soa() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
 
     // Use a resolver that would fail -- doesn't matter for SOA since it goes upstream.
-    let resolver = Arc::new(MockResolver::new()) as Arc<dyn Resolver>;
+    let resolver = Arc::new(MockResolver::new());
     let (proxy_addr, _proxy_handle) =
         start_proxy(resolver, &upstream_addr.to_string(), false).await;
 
@@ -640,7 +638,7 @@ async fn test_upstream_fallback_soa() {
     );
     assert!(!resp.answers().is_empty(), "expected at least one answer");
 
-    let rdata = resp.answers()[0].data().expect("record should have data");
+    let rdata = resp.answers()[0].data();
     match rdata {
         RData::SOA(soa) => {
             assert_eq!(
@@ -658,7 +656,7 @@ async fn test_upstream_fallback_soa() {
 async fn test_upstream_fallback_tcp() {
     let (upstream_addr, _upstream_handle) = start_mock_tcp_upstream().await;
 
-    let resolver = Arc::new(MockResolver::new()) as Arc<dyn Resolver>;
+    let resolver = Arc::new(MockResolver::new());
     let (proxy_addr, _proxy_handle) =
         start_tcp_proxy(resolver, &upstream_addr.to_string(), false).await;
 
@@ -678,7 +676,7 @@ async fn test_upstream_fallback_tcp() {
 async fn test_unreachable_upstream() {
     // Use an address where nothing is listening.
     let dead_upstream = "127.0.0.1:59999";
-    let resolver = Arc::new(MockResolver::new()) as Arc<dyn Resolver>;
+    let resolver = Arc::new(MockResolver::new());
     let (proxy_addr, _proxy_handle) = start_proxy(resolver, dead_upstream, true).await;
 
     // SOA goes through upstream fallback, which should fail -> SERVFAIL.
@@ -706,7 +704,7 @@ async fn test_unreachable_upstream() {
 /// Port of Go TestVerboseLogging
 #[tokio::test]
 async fn test_verbose_logging() {
-    let resolver = Arc::new(full_mock_resolver()) as Arc<dyn Resolver>;
+    let resolver = Arc::new(full_mock_resolver());
     let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", true).await;
 
     // Query with verbose=true, just verify it doesn't panic.
@@ -722,7 +720,7 @@ async fn test_verbose_logging() {
 #[tokio::test]
 async fn test_verbose_logging_upstream_fallback() {
     let (upstream_addr, _upstream_handle) = start_mock_upstream().await;
-    let resolver = Arc::new(full_mock_resolver()) as Arc<dyn Resolver>;
+    let resolver = Arc::new(full_mock_resolver());
     let (proxy_addr, _proxy_handle) =
         start_proxy(resolver, &upstream_addr.to_string(), true).await;
 
@@ -813,7 +811,7 @@ fn test_is_supported_by_system_resolver() {
 /// Port of Go TestEmptyQuestion
 #[tokio::test]
 async fn test_empty_question() {
-    let resolver = Arc::new(full_mock_resolver()) as Arc<dyn Resolver>;
+    let resolver = Arc::new(full_mock_resolver());
     let (proxy_addr, _handle) = start_proxy(resolver, "127.0.0.1:59999", false).await;
 
     // Send an empty query (no questions).

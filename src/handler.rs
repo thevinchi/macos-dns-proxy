@@ -15,9 +15,9 @@ const DEFAULT_TTL: u32 = 60;
 /// or upstream server based on query type.
 ///
 /// This is the Rust equivalent of the Go `handleDNS` function.
-pub async fn handle_dns(
+pub async fn handle_dns<R: Resolver>(
     request: &Message,
-    resolver: &dyn Resolver,
+    resolver: &R,
     upstream_addr: &str,
     protocol: &str,
     remote_addr: SocketAddr,
@@ -86,8 +86,8 @@ pub async fn handle_dns(
 /// Resolve A/AAAA queries via the system resolver (getaddrinfo).
 ///
 /// Maps to the Go `resolveHost` function.
-async fn resolve_host(
-    resolver: &dyn Resolver,
+async fn resolve_host<R: Resolver>(
+    resolver: &R,
     request: &Message,
     name: &Name,
     qtype: RecordType,
@@ -136,8 +136,8 @@ async fn resolve_host(
 /// Unlike the Go version which uses individual Lookup* methods and constructs
 /// records manually, we use res_query which returns full DNS records with
 /// real TTLs.
-async fn resolve_via_system(
-    resolver: &dyn Resolver,
+async fn resolve_via_system<R: Resolver>(
+    resolver: &R,
     request: &Message,
     name: &Name,
     qtype: RecordType,

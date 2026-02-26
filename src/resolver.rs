@@ -1,7 +1,6 @@
 use std::fmt;
 use std::net::IpAddr;
 
-use async_trait::async_trait;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::{Record, RecordType};
 
@@ -27,19 +26,18 @@ impl std::error::Error for ResolveError {}
 
 /// Trait abstracting DNS resolution, allowing the system resolver to be
 /// swapped with a mock in tests.
-#[async_trait]
 pub trait Resolver: Send + Sync {
     /// Resolve A/AAAA records via getaddrinfo. Returns IP addresses.
-    async fn lookup_host(&self, name: &str) -> Result<Vec<IpAddr>, ResolveError>;
+    fn lookup_host(&self, name: &str) -> impl std::future::Future<Output = Result<Vec<IpAddr>, ResolveError>> + Send;
 
     /// Query specific DNS record types via the system resolver (res_query).
     /// Used for CNAME, MX, TXT, SRV, NS, PTR queries.
     /// Returns the answer records from the DNS response.
-    async fn query_records(
+    fn query_records(
         &self,
         name: &str,
         record_type: RecordType,
-    ) -> Result<Vec<Record>, ResolveError>;
+    ) -> impl std::future::Future<Output = Result<Vec<Record>, ResolveError>> + Send;
 }
 
 /// Returns true if the query type is handled via the system resolver.
@@ -66,23 +64,24 @@ pub fn is_supported_by_system_resolver(qtype: RecordType) -> bool {
 /// - CNAME/MX/TXT/SRV/NS/PTR queries use `res_query` (via FFI).
 pub struct SystemResolver;
 
-#[async_trait]
 impl Resolver for SystemResolver {
     async fn lookup_host(&self, name: &str) -> Result<Vec<IpAddr>, ResolveError> {
         let name = name.trim_end_matches('.').to_string();
         tokio::task::spawn_blocking(move || {
-            dns_lookup::lookup_host(&name).map_err(|e| {
-                let msg = e.to_string().to_lowercase();
-                if msg.contains("not found")
-                    || msg.contains("no address")
-                    || msg.contains("nodename nor servname")
-                    || msg.contains("name or service not known")
-                {
-                    ResolveError::NotFound
-                } else {
-                    ResolveError::Failed(e.to_string())
-                }
-            })
+            dns_lookup::lookup_host(&name)
+                .map(|iter| iter.collect())
+                .map_err(|e| {
+                    let msg = e.to_string().to_lowercase();
+                    if msg.contains("not found")
+                        || msg.contains("no address")
+                        || msg.contains("nodename nor servname")
+                        || msg.contains("name or service not known")
+                    {
+                        ResolveError::NotFound
+                    } else {
+                        ResolveError::Failed(e.to_string())
+                    }
+                })
         })
         .await
         .map_err(|e| ResolveError::Failed(format!("task join error: {}", e)))?
@@ -124,7 +123,7 @@ const C_IN: i32 = 1;
 // Link to libresolv for res_query.
 // On macOS this is part of libSystem; on Linux it's a separate library.
 #[link(name = "resolv")]
-extern "C" {
+unsafe extern "C" {
     fn res_query(
         dname: *const libc::c_char,
         class: libc::c_int,

@@ -4,7 +4,7 @@ PLIST_DST := /Library/LaunchDaemons/com.local.macos-dns-proxy.plist
 INSTALL_BIN := /usr/local/bin/$(BINARY)
 LOG_FILE  := /var/log/macos-dns-proxy.log
 
-.PHONY: build test clean install uninstall
+.PHONY: build test clean install uninstall status logs
 
 build:
 	cargo build --release
@@ -49,3 +49,9 @@ uninstall:
 	sudo rm -f $(INSTALL_BIN)
 	sudo rm -f $(PLIST_DST)
 	@echo "$(BINARY) uninstalled."
+
+status:
+	@sudo launchctl list | grep macos-dns-proxy || echo "Service not found (not installed or not loaded)"
+
+logs:
+	@tail -f $(LOG_FILE)

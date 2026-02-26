@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
 use macos_dns_proxy::handler;
-use macos_dns_proxy::resolver::{Resolver, SystemResolver};
+use macos_dns_proxy::resolver::SystemResolver;
 
 /// A lightweight DNS forwarding proxy for macOS.
 ///
@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
     let listen_addr = cli.listen.clone();
     let upstream = Arc::new(cli.upstream.clone());
     let verbose = cli.verbose;
-    let resolver: Arc<dyn Resolver> = Arc::new(SystemResolver);
+    let resolver = Arc::new(SystemResolver);
 
     tracing::info!("starting UDP listener on {}", listen_addr);
     tracing::info!("starting TCP listener on {}", listen_addr);
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
 /// Run the UDP DNS server loop.
 async fn run_udp_server(
     addr: &str,
-    resolver: Arc<dyn Resolver>,
+    resolver: Arc<SystemResolver>,
     upstream: Arc<String>,
     verbose: bool,
 ) -> Result<()> {
@@ -119,7 +119,7 @@ async fn run_udp_server(
 /// Run the TCP DNS server loop.
 async fn run_tcp_server(
     addr: &str,
-    resolver: Arc<dyn Resolver>,
+    resolver: Arc<SystemResolver>,
     upstream: Arc<String>,
     verbose: bool,
 ) -> Result<()> {
@@ -147,7 +147,7 @@ async fn run_tcp_server(
 async fn handle_tcp_connection(
     mut stream: tokio::net::TcpStream,
     src: SocketAddr,
-    resolver: Arc<dyn Resolver>,
+    resolver: Arc<SystemResolver>,
     upstream: Arc<String>,
     verbose: bool,
 ) -> Result<()> {
