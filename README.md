@@ -163,12 +163,15 @@ The proxy handles DNS queries in two ways depending on the record type:
 
 2. **DNSServiceQueryRecord path** (every other type: CNAME, MX, TXT, SRV, NS,
    PTR, SOA, CAA, ...):
-   Uses `DNSServiceQueryRecord()` from `dns_sd.h` (mDNSResponder). It honors the
-   same split-DNS configuration as `getaddrinfo` and returns full records with
-   their real TTLs. Outcomes are mapped honestly: records present → NOERROR with
-   answers; name exists but no record of that type → NODATA (NOERROR, empty
-   answers); name does not exist → NXDOMAIN; timeout or other error → SERVFAIL
-   (so clients retry rather than caching a false "does not exist").
+   Uses `DNSServiceQueryRecord()` from `dns_sd.h` (mDNSResponder), with the
+   `kDNSServiceFlagsReturnIntermediates` flag set so that negative answers are
+   delivered to the callback promptly instead of the query waiting silently.
+   It honors the same split-DNS configuration as `getaddrinfo` and returns full
+   records with their real TTLs. Outcomes are mapped honestly: records present
+   → NOERROR with answers; name exists but no record of that type → NODATA
+   (NOERROR, empty answers), returned promptly; name does not exist → NXDOMAIN,
+   returned promptly; timeout or other error → SERVFAIL (so clients retry
+   rather than caching a false "does not exist").
 
 Verbose mode logs which path was used for each query:
 ```

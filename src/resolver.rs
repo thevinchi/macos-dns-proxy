@@ -158,6 +158,12 @@ mod dns_sd {
     /// pending in the same batch; the last reply of a batch has it clear.
     const KDNS_SERVICE_FLAGS_MORE_COMING: DNSServiceFlags = 0x1;
 
+    /// `kDNSServiceFlagsReturnIntermediates` — deliver intermediate results
+    /// (e.g. CNAMEs) AND negative answers to the callback promptly, instead of
+    /// the query silently waiting (which otherwise makes a nonexistent name hit
+    /// our timeout and SERVFAIL instead of returning a prompt NXDOMAIN/NODATA).
+    const KDNS_SERVICE_FLAGS_RETURN_INTERMEDIATES: DNSServiceFlags = 0x1000;
+
     /// DNS class IN (Internet).
     const KDNS_SERVICE_CLASS_IN: u16 = 1;
 
@@ -299,7 +305,7 @@ mod dns_sd {
         let start_err = unsafe {
             DNSServiceQueryRecord(
                 &mut sd_ref,
-                0,
+                KDNS_SERVICE_FLAGS_RETURN_INTERMEDIATES,
                 0,
                 c_name.as_ptr(),
                 u16::from(record_type),
