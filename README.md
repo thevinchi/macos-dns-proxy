@@ -168,10 +168,15 @@ The proxy handles DNS queries in two ways depending on the record type:
    delivered to the callback promptly instead of the query waiting silently.
    It honors the same split-DNS configuration as `getaddrinfo` and returns full
    records with their real TTLs. Outcomes are mapped honestly: records present
-   → NOERROR with answers; name exists but no record of that type → NODATA
-   (NOERROR, empty answers), returned promptly; name does not exist → NXDOMAIN,
+   → NOERROR with answers; name exists but no record of that type
+   (`kDNSServiceErr_NoSuchRecord`) → NODATA (NOERROR, empty answers), returned
+   promptly; name does not exist (`kDNSServiceErr_NoSuchName`) → NXDOMAIN,
    returned promptly; timeout or other error → SERVFAIL (so clients retry
-   rather than caching a false "does not exist").
+   rather than caching a false "does not exist"). In practice,
+   `DNSServiceQueryRecord` is record-type-centric and mDNSResponder usually
+   reports "no such record" rather than distinguishing true name-nonexistence,
+   so a nonexistent name is typically observed as a prompt NODATA rather than
+   NXDOMAIN -- see [Edge Cases](#edge-cases).
 
 Verbose mode logs which path was used for each query:
 ```
@@ -187,6 +192,16 @@ make test
 
 ## Edge Cases
 
+- **Nonexistent names return NODATA, not NXDOMAIN**: For the
+  `DNSServiceQueryRecord` path, querying a name that doesn't exist at all
+  typically comes back as a prompt NOERROR/empty (NODATA) rather than
+  NXDOMAIN. This is an artifact of `DNSServiceQueryRecord` being a
+  record-type-centric API -- mDNSResponder reports "no such record" for that
+  type instead of distinguishing outright name-nonexistence. It's intentional
+  behavior on Apple's side (the code still maps a true `NoSuchName` to
+  NXDOMAIN when mDNSResponder reports it), and it's harmless here: the
+  response is fast and fails safe, and clients simply see "no answer" either
+  way.
 - **Network interface not up**: If the listen interface isn't available, the
   proxy will fail to bind. The launchd `KeepAlive` directive will restart it
   automatically until the interface comes up.
