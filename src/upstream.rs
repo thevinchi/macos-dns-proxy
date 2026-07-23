@@ -6,10 +6,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 
-/// Forward a DNS query to the upstream server using the same protocol
+/// Forward a DNS query to an upstream server using the same protocol
 /// (UDP or TCP) as the incoming request.
 ///
-/// This is the Rust equivalent of the Go `forwardUpstream` function.
+/// This is an optional helper: it is NOT part of the default request path. The
+/// handler now serves every query type through the macOS system resolver
+/// (`getaddrinfo` for A/AAAA, `DNSServiceQueryRecord` for the rest), so nothing
+/// is routed upstream automatically. Kept for callers that want to forward to a
+/// specific server explicitly.
 pub async fn forward_upstream(
     request: &Message,
     upstream: &str,

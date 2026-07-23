@@ -18,8 +18,8 @@ impl std::error::Error for PtrParseError {}
 /// ip6.arpa name) back to an IP address string for use with reverse lookups.
 ///
 /// This is a direct port of the Go `ptrToAddr` function.
-/// Currently used by tests; the main handler uses res_query for PTR lookups
-/// which accepts the PTR name directly.
+/// Currently used by tests; the main handler passes the PTR name directly to
+/// `DNSServiceQueryRecord`, which accepts the reverse-DNS name as-is.
 #[allow(dead_code)]
 pub fn ptr_to_addr(name: &str) -> Result<String, PtrParseError> {
     let name = name.strip_suffix('.').unwrap_or(name);
