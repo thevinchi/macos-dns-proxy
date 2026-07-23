@@ -5,21 +5,19 @@ use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 
-use crate::resolver::{ResolveError, Resolver, is_supported_by_system_resolver};
-use crate::upstream;
+use crate::resolver::{ResolveError, Resolver};
 
 /// Default TTL for records resolved via getaddrinfo (which doesn't expose TTLs).
 const DEFAULT_TTL: u32 = 60;
 
-/// Central DNS request handler. Dispatches queries to the system resolver
-/// or upstream server based on query type.
+/// Central DNS request handler. Dispatches queries to the system resolver based
+/// on query type: A/AAAA via `getaddrinfo`, everything else via
+/// `DNSServiceQueryRecord`. Both paths honor the macOS split-DNS configuration.
 ///
 /// This is the Rust equivalent of the Go `handleDNS` function.
 pub async fn handle_dns<R: Resolver>(
     request: &Message,
     resolver: &R,
-    upstream_addr: &str,
-    protocol: &str,
     remote_addr: SocketAddr,
     verbose: bool,
 ) -> Message {
@@ -34,15 +32,7 @@ pub async fn handle_dns<R: Resolver>(
 
     let result = match qtype {
         RecordType::A | RecordType::AAAA => resolve_host(resolver, request, &qname, qtype).await,
-        RecordType::CNAME
-        | RecordType::MX
-        | RecordType::TXT
-        | RecordType::SRV
-        | RecordType::NS
-        | RecordType::PTR => resolve_via_system(resolver, request, &qname, qtype).await,
-        _ => upstream::forward_upstream(request, upstream_addr, protocol)
-            .await
-            .map_err(|e| ResolveError::Failed(e.to_string())),
+        _ => resolve_via_system(resolver, request, &qname, qtype).await,
     };
 
     let elapsed = start.elapsed();
@@ -50,10 +40,9 @@ pub async fn handle_dns<R: Resolver>(
     match result {
         Ok(response) => {
             if verbose {
-                let method = if is_supported_by_system_resolver(qtype) {
-                    "system"
-                } else {
-                    "upstream"
+                let method = match qtype {
+                    RecordType::A | RecordType::AAAA => "getaddrinfo",
+                    _ => "dns-sd",
                 };
                 tracing::info!(
                     "query {} {} from {} -> {} [{}] ({:?})",
@@ -131,11 +120,13 @@ async fn resolve_host<R: Resolver>(
     Ok(response)
 }
 
-/// Resolve CNAME/MX/TXT/SRV/NS/PTR queries via the system resolver (res_query).
+/// Resolve every non-A/AAAA query type via the system resolver
+/// (`DNSServiceQueryRecord` on macOS), which returns full DNS records with real
+/// TTLs and honors split-DNS.
 ///
-/// Unlike the Go version which uses individual Lookup* methods and constructs
-/// records manually, we use res_query which returns full DNS records with
-/// real TTLs.
+/// Error mapping is deliberate: a missing name yields NXDOMAIN, while a name that
+/// exists but has no record of the requested type yields NODATA (NOERROR with an
+/// empty answer section) rather than a false NXDOMAIN.
 async fn resolve_via_system<R: Resolver>(
     resolver: &R,
     request: &Message,

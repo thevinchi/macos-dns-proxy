@@ -1,8 +1,12 @@
 //! Integration tests for macos-dns-proxy.
 //!
-//! Tests the full DNS proxy pipeline end-to-end using mock resolvers and
-//! mock upstream DNS servers. All servers bind to ephemeral ports on localhost
-//! for full test isolation.
+//! Tests the full DNS proxy pipeline end-to-end using mock resolvers. All
+//! servers bind to ephemeral ports on localhost for full test isolation.
+//!
+//! Routing under test: A/AAAA go through `lookup_host` (getaddrinfo); every other
+//! type goes through `query_records` (DNSServiceQueryRecord on macOS). There is
+//! no default upstream path — the mock resolver stands in for the system
+//! resolver on all types.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -10,8 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
-use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
-use hickory_proto::rr::rdata::{A, CNAME, MX, NS, PTR as PtrRData, SOA, SRV, TXT};
+use hickory_proto::op::{Message, Query, ResponseCode};
+use hickory_proto::rr::rdata::{CNAME, MX, NS, PTR as PtrRData, SOA, SRV, TXT};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use rstest::rstest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -69,6 +73,8 @@ impl Resolver for MockResolver {
         record_type: RecordType,
     ) -> Result<Vec<Record>, ResolveError> {
         let name = name.trim_end_matches('.');
+        // A present-but-empty entry models NODATA (name exists, no such record):
+        // Ok(vec![]). A missing entry models NXDOMAIN: Err(NotFound).
         self.records
             .get(&(name.to_string(), record_type))
             .cloned()
@@ -186,6 +192,25 @@ fn full_mock_resolver() -> MockResolver {
         )],
     );
 
+    // SOA record -- now served by the system resolver (was upstream-only before).
+    resolver.add_records(
+        "example.com",
+        RecordType::SOA,
+        vec![Record::from_rdata(
+            name.clone(),
+            60,
+            RData::SOA(SOA::new(
+                Name::from_ascii("ns1.example.com.").unwrap(),
+                Name::from_ascii("admin.example.com.").unwrap(),
+                2024010101,
+                3600,
+                600,
+                604800,
+                60,
+            )),
+        )],
+    );
+
     // PTR record (reverse lookup for 93.184.216.34)
     let ptr_name = Name::from_ascii("34.216.184.93.in-addr.arpa.").unwrap();
     resolver.add_records(
@@ -202,191 +227,17 @@ fn full_mock_resolver() -> MockResolver {
 }
 
 // ---------------------------------------------------------------------------
-// Mock upstream DNS server helpers
-// ---------------------------------------------------------------------------
-
-/// Start a mock UDP upstream DNS server that returns canned responses.
-/// Returns A records for A queries, SOA records for SOA queries, NXDOMAIN otherwise.
-async fn start_mock_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let addr = socket.local_addr().unwrap();
-
-    let handle = tokio::spawn({
-        let socket = socket.clone();
-        async move {
-            let mut buf = vec![0u8; 4096];
-            loop {
-                let (len, src) = match socket.recv_from(&mut buf).await {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-                let request = match Message::from_vec(&buf[..len]) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-
-                let mut response = Message::new();
-                response.set_id(request.id());
-                response.set_message_type(MessageType::Response);
-                response.set_op_code(request.op_code());
-                response.set_recursion_desired(request.recursion_desired());
-                response.set_recursion_available(true);
-                response.set_authoritative(true);
-                for q in request.queries() {
-                    response.add_query(q.clone());
-                }
-
-                if let Some(q) = request.queries().first() {
-                    let name = q.name().clone();
-                    match q.query_type() {
-                        RecordType::A => {
-                            response.add_answer(Record::from_rdata(
-                                name,
-                                60,
-                                RData::A(A(Ipv4Addr::new(93, 184, 216, 34))),
-                            ));
-                        }
-                        RecordType::SOA => {
-                            response.add_answer(Record::from_rdata(
-                                name,
-                                60,
-                                RData::SOA(SOA::new(
-                                    Name::from_ascii("ns1.example.com.").unwrap(),
-                                    Name::from_ascii("admin.example.com.").unwrap(),
-                                    2024010101,
-                                    3600,
-                                    600,
-                                    604800,
-                                    60,
-                                )),
-                            ));
-                        }
-                        _ => {
-                            response.set_response_code(ResponseCode::NXDomain);
-                        }
-                    }
-                }
-
-                if let Ok(bytes) = response.to_vec() {
-                    let _ = socket.send_to(&bytes, src).await;
-                }
-            }
-        }
-    });
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    (addr, handle)
-}
-
-/// Start a mock TCP upstream DNS server that returns SOA records for SOA queries
-/// and A records for everything else.
-async fn start_mock_tcp_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let handle = tokio::spawn(async move {
-        loop {
-            let (mut stream, _) = match listener.accept().await {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-
-            tokio::spawn(async move {
-                // Read length prefix + message.
-                let mut len_buf = [0u8; 2];
-                if stream.read_exact(&mut len_buf).await.is_err() {
-                    return;
-                }
-                let msg_len = u16::from_be_bytes(len_buf) as usize;
-                let mut msg_buf = vec![0u8; msg_len];
-                if stream.read_exact(&mut msg_buf).await.is_err() {
-                    return;
-                }
-
-                let request = match Message::from_vec(&msg_buf) {
-                    Ok(m) => m,
-                    Err(_) => return,
-                };
-
-                let mut response = Message::new();
-                response.set_id(request.id());
-                response.set_message_type(MessageType::Response);
-                response.set_op_code(request.op_code());
-                response.set_recursion_desired(request.recursion_desired());
-                response.set_recursion_available(true);
-                response.set_authoritative(true);
-                for q in request.queries() {
-                    response.add_query(q.clone());
-                }
-
-                if let Some(q) = request.queries().first() {
-                    let name = q.name().clone();
-                    match q.query_type() {
-                        RecordType::SOA => {
-                            response.add_answer(Record::from_rdata(
-                                name,
-                                60,
-                                RData::SOA(SOA::new(
-                                    Name::from_ascii("ns1.example.com.").unwrap(),
-                                    Name::from_ascii("admin.example.com.").unwrap(),
-                                    2024010101,
-                                    3600,
-                                    600,
-                                    604800,
-                                    60,
-                                )),
-                            ));
-                        }
-                        _ => {
-                            response.add_answer(Record::from_rdata(
-                                name,
-                                60,
-                                RData::A(A(Ipv4Addr::new(93, 184, 216, 34))),
-                            ));
-                        }
-                    }
-                }
-
-                if let Ok(bytes) = response.to_vec() {
-                    let len_prefix = (bytes.len() as u16).to_be_bytes();
-                    let _ = stream.write_all(&len_prefix).await;
-                    let _ = stream.write_all(&bytes).await;
-                }
-            });
-        }
-    });
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    (addr, handle)
-}
-
-// ---------------------------------------------------------------------------
-// Dead upstream helper -- bind and immediately release a port
-// ---------------------------------------------------------------------------
-
-/// Returns a localhost address where nothing is listening.
-/// Binds an ephemeral port, captures the address, then drops the socket.
-async fn dead_upstream_addr() -> String {
-    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr = socket.local_addr().unwrap();
-    drop(socket);
-    addr.to_string()
-}
-
-// ---------------------------------------------------------------------------
 // Proxy startup helpers
 // ---------------------------------------------------------------------------
 
-/// Start a UDP proxy server with the given resolver and upstream.
+/// Start a UDP proxy server with the given resolver.
 /// Returns the proxy address and a JoinHandle (caller should abort on cleanup).
 async fn start_proxy<R: Resolver + 'static>(
     resolver: Arc<R>,
-    upstream_addr: &str,
     verbose: bool,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let addr = socket.local_addr().unwrap();
-    let upstream = upstream_addr.to_string();
 
     let handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
@@ -400,9 +251,7 @@ async fn start_proxy<R: Resolver + 'static>(
                 Err(_) => continue,
             };
 
-            let response =
-                handler::handle_dns(&request, resolver.as_ref(), &upstream, "udp", src, verbose)
-                    .await;
+            let response = handler::handle_dns(&request, resolver.as_ref(), src, verbose).await;
 
             if let Ok(bytes) = response.to_vec() {
                 let _ = socket.send_to(&bytes, src).await;
@@ -418,12 +267,10 @@ async fn start_proxy<R: Resolver + 'static>(
 /// Returns the proxy address and a JoinHandle (caller should abort on cleanup).
 async fn start_tcp_proxy<R: Resolver + 'static>(
     resolver: Arc<R>,
-    upstream_addr: &str,
     verbose: bool,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let upstream = upstream_addr.to_string();
 
     let handle = tokio::spawn(async move {
         loop {
@@ -433,7 +280,6 @@ async fn start_tcp_proxy<R: Resolver + 'static>(
             };
 
             let resolver = resolver.clone();
-            let upstream = upstream.clone();
             tokio::spawn(async move {
                 let mut len_buf = [0u8; 2];
                 if stream.read_exact(&mut len_buf).await.is_err() {
@@ -450,15 +296,7 @@ async fn start_tcp_proxy<R: Resolver + 'static>(
                     Err(_) => return,
                 };
 
-                let response = handler::handle_dns(
-                    &request,
-                    resolver.as_ref(),
-                    &upstream,
-                    "tcp",
-                    src,
-                    verbose,
-                )
-                .await;
+                let response = handler::handle_dns(&request, resolver.as_ref(), src, verbose).await;
 
                 if let Ok(bytes) = response.to_vec() {
                     let len_prefix = (bytes.len() as u16).to_be_bytes();
@@ -549,8 +387,7 @@ async fn query_proxy(
 #[tokio::test]
 async fn test_system_resolver_a() {
     let resolver = Arc::new(full_mock_resolver());
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::A).await;
 
@@ -575,8 +412,7 @@ async fn test_system_resolver_aaaa() {
         )],
     );
     let resolver = Arc::new(resolver);
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::AAAA).await;
 
@@ -596,8 +432,7 @@ async fn test_system_resolver_aaaa() {
 #[tokio::test]
 async fn test_system_resolver_mx() {
     let resolver = Arc::new(full_mock_resolver());
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::MX).await;
 
@@ -617,8 +452,7 @@ async fn test_system_resolver_mx() {
 #[tokio::test]
 async fn test_system_resolver_txt() {
     let resolver = Arc::new(full_mock_resolver());
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::TXT).await;
 
@@ -645,8 +479,7 @@ async fn test_system_resolver_txt() {
 #[tokio::test]
 async fn test_system_resolver_ns() {
     let resolver = Arc::new(full_mock_resolver());
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::NS).await;
 
@@ -665,8 +498,7 @@ async fn test_system_resolver_ns() {
 #[tokio::test]
 async fn test_system_resolver_cname() {
     let resolver = Arc::new(full_mock_resolver());
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::CNAME).await;
 
@@ -685,8 +517,7 @@ async fn test_system_resolver_cname() {
 #[tokio::test]
 async fn test_system_resolver_srv() {
     let resolver = Arc::new(full_mock_resolver());
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::SRV).await;
 
@@ -708,8 +539,7 @@ async fn test_system_resolver_srv() {
 #[tokio::test]
 async fn test_system_resolver_ptr() {
     let resolver = Arc::new(full_mock_resolver());
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     let resp = query_proxy(
         proxy_addr,
@@ -732,16 +562,17 @@ async fn test_system_resolver_ptr() {
 }
 
 // ===========================================================================
-// Upstream Fallback Tests
+// SOA via the system resolver
+//
+// SOA (and every other non-A/AAAA type) now flows through query_records, the
+// same path as MX/TXT/etc. Previously SOA was forwarded to a (dead-by-default)
+// upstream; that path is gone.
 // ===========================================================================
 
 #[tokio::test]
-async fn test_upstream_fallback_soa_udp() {
-    let (upstream_addr, upstream_handle) = start_mock_upstream().await;
-
-    // Empty resolver -- doesn't matter for SOA since it goes upstream.
-    let resolver = Arc::new(MockResolver::new());
-    let (proxy_addr, proxy_handle) = start_proxy(resolver, &upstream_addr.to_string(), false).await;
+async fn test_soa_via_system_udp() {
+    let resolver = Arc::new(full_mock_resolver());
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::SOA).await;
 
@@ -754,47 +585,45 @@ async fn test_upstream_fallback_soa_udp() {
         other => panic!("expected SOA record, got {:?}", other),
     }
 
-    proxy_handle.abort();
-    upstream_handle.abort();
+    handle.abort();
 }
 
 #[tokio::test]
-async fn test_upstream_fallback_soa_tcp() {
-    let (upstream_addr, upstream_handle) = start_mock_tcp_upstream().await;
-
-    let resolver = Arc::new(MockResolver::new());
-    let (proxy_addr, proxy_handle) =
-        start_tcp_proxy(resolver, &upstream_addr.to_string(), false).await;
+async fn test_soa_via_system_tcp() {
+    let resolver = Arc::new(full_mock_resolver());
+    let (proxy_addr, handle) = start_tcp_proxy(resolver, false).await;
 
     let resp = query_proxy(proxy_addr, "tcp", "example.com.", RecordType::SOA).await;
 
-    // Verify the response code AND body content.
     assert_eq!(resp.response_code(), ResponseCode::NoError);
-    assert!(
-        !resp.answers().is_empty(),
-        "expected at least one answer from TCP upstream"
-    );
+    assert!(!resp.answers().is_empty(), "expected at least one answer");
     match resp.answers()[0].data() {
         RData::SOA(soa) => {
             assert_eq!(soa.mname().to_ascii(), "ns1.example.com.");
         }
-        other => panic!("expected SOA record from TCP upstream, got {:?}", other),
+        other => panic!("expected SOA record, got {:?}", other),
     }
 
-    proxy_handle.abort();
-    upstream_handle.abort();
+    handle.abort();
 }
 
+/// A resolver failure on the SOA path must map to SERVFAIL (not NXDOMAIN), over
+/// both UDP and TCP.
+#[rstest]
+#[case::udp("udp")]
+#[case::tcp("tcp")]
 #[tokio::test]
-async fn test_unreachable_upstream_udp() {
-    let dead = dead_upstream_addr().await;
-    let resolver = Arc::new(MockResolver::new());
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+async fn test_soa_resolver_failure_servfail(#[case] proto: &str) {
+    let resolver = Arc::new(FailingMockResolver);
+    let (proxy_addr, handle) = if proto == "tcp" {
+        start_tcp_proxy(resolver, false).await
+    } else {
+        start_proxy(resolver, false).await
+    };
 
-    // SOA goes through upstream fallback, which should fail -> SERVFAIL.
     let resp = query_proxy_with_timeout(
         proxy_addr,
-        "udp",
+        proto,
         "example.com.",
         RecordType::SOA,
         Duration::from_secs(10),
@@ -806,22 +635,32 @@ async fn test_unreachable_upstream_udp() {
     handle.abort();
 }
 
+// ===========================================================================
+// NODATA -- name exists, no record of the requested type
+//
+// Exercises the error-mapping fix: an empty answer set (Ok(vec![])) must yield
+// NOERROR with no answers, NOT a false NXDOMAIN.
+// ===========================================================================
+
 #[tokio::test]
-async fn test_unreachable_upstream_tcp() {
-    let dead = dead_upstream_addr().await;
-    let resolver = Arc::new(MockResolver::new());
-    let (proxy_addr, handle) = start_tcp_proxy(resolver, &dead, false).await;
+async fn test_nodata_returns_noerror_empty() {
+    let mut resolver = MockResolver::new();
+    // Present-but-empty entry: the name exists but has no MX record.
+    resolver.add_records("example.com", RecordType::MX, vec![]);
+    let resolver = Arc::new(resolver);
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
-    let resp = query_proxy_with_timeout(
-        proxy_addr,
-        "tcp",
-        "example.com.",
-        RecordType::SOA,
-        Duration::from_secs(10),
-    )
-    .await;
+    let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::MX).await;
 
-    assert_eq!(resp.response_code(), ResponseCode::ServFail);
+    assert_eq!(
+        resp.response_code(),
+        ResponseCode::NoError,
+        "NODATA must be NOERROR, not NXDOMAIN"
+    );
+    assert!(
+        resp.answers().is_empty(),
+        "NODATA must have an empty answer section"
+    );
 
     handle.abort();
 }
@@ -831,17 +670,12 @@ async fn test_unreachable_upstream_tcp() {
 // ===========================================================================
 
 #[rstest]
-#[case::success_path("example.com.", RecordType::A, false)]
-#[case::nxdomain_path("nonexistent.example.com.", RecordType::A, false)]
+#[case::success_path("example.com.", RecordType::A)]
+#[case::nxdomain_path("nonexistent.example.com.", RecordType::A)]
 #[tokio::test]
-async fn test_verbose_logging(
-    #[case] domain: &str,
-    #[case] qtype: RecordType,
-    #[case] _use_failing_resolver: bool,
-) {
+async fn test_verbose_logging(#[case] domain: &str, #[case] qtype: RecordType) {
     let resolver = Arc::new(full_mock_resolver());
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, true).await;
+    let (proxy_addr, handle) = start_proxy(resolver, true).await;
 
     // Just verify the query completes without panic.
     let _resp = query_proxy(proxy_addr, "udp", domain, qtype).await;
@@ -850,24 +684,21 @@ async fn test_verbose_logging(
 }
 
 #[tokio::test]
-async fn test_verbose_logging_upstream_fallback() {
-    let (upstream_addr, upstream_handle) = start_mock_upstream().await;
+async fn test_verbose_logging_soa() {
     let resolver = Arc::new(full_mock_resolver());
-    let (proxy_addr, proxy_handle) = start_proxy(resolver, &upstream_addr.to_string(), true).await;
+    let (proxy_addr, handle) = start_proxy(resolver, true).await;
 
-    // SOA goes through upstream -- verify verbose logging doesn't panic.
+    // SOA goes through the system resolver -- verify verbose logging doesn't panic.
     let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::SOA).await;
     assert_eq!(resp.response_code(), ResponseCode::NoError);
 
-    proxy_handle.abort();
-    upstream_handle.abort();
+    handle.abort();
 }
 
 #[tokio::test]
 async fn test_verbose_logging_resolver_failure() {
     let resolver = Arc::new(FailingMockResolver);
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, true).await;
+    let (proxy_addr, handle) = start_proxy(resolver, true).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example.com.", RecordType::A).await;
     assert_eq!(resp.response_code(), ResponseCode::ServFail);
@@ -882,8 +713,7 @@ async fn test_verbose_logging_resolver_failure() {
 #[tokio::test]
 async fn test_empty_question_returns_refused() {
     let resolver = Arc::new(full_mock_resolver());
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     // Send an empty query (no questions).
     let mut msg = Message::new();
@@ -918,8 +748,7 @@ async fn test_empty_question_returns_refused() {
 #[tokio::test]
 async fn test_a_query_filters_ipv6() {
     let resolver = Arc::new(full_mock_resolver());
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example-both.com.", RecordType::A).await;
 
@@ -942,8 +771,7 @@ async fn test_a_query_filters_ipv6() {
 #[tokio::test]
 async fn test_aaaa_query_filters_ipv4() {
     let resolver = Arc::new(full_mock_resolver());
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example-both.com.", RecordType::AAAA).await;
 
@@ -973,18 +801,17 @@ async fn test_aaaa_query_filters_ipv4() {
 // NXDOMAIN Tests -- parameterized across record types and code paths
 // ===========================================================================
 
-/// NXDOMAIN for host-lookup path (A/AAAA) and record-query path (MX/TXT).
+/// NXDOMAIN for host-lookup path (A/AAAA) and record-query path (MX).
 /// Each pair exercises a distinct code path in the handler:
 /// - A/AAAA -> resolve_host
-/// - MX/TXT -> resolve_via_system
+/// - MX     -> resolve_via_system
 #[rstest]
 #[case::a(RecordType::A)]
 #[case::mx(RecordType::MX)]
 #[tokio::test]
 async fn test_nxdomain(#[case] qtype: RecordType) {
     let resolver = Arc::new(full_mock_resolver());
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "nonexistent.example.com.", qtype).await;
 
@@ -1012,8 +839,7 @@ async fn test_nxdomain(#[case] qtype: RecordType) {
 #[tokio::test]
 async fn test_resolver_failed_returns_servfail(#[case] qtype: RecordType) {
     let resolver = Arc::new(FailingMockResolver);
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     let resp = query_proxy(proxy_addr, "udp", "example.com.", qtype).await;
 
@@ -1028,7 +854,10 @@ async fn test_resolver_failed_returns_servfail(#[case] qtype: RecordType) {
 }
 
 // ===========================================================================
-// Direct Upstream Tests
+// Direct Upstream Helper Test
+//
+// forward_upstream is no longer on the default request path, but remains a
+// public helper; verify its protocol validation still holds.
 // ===========================================================================
 
 #[tokio::test]
@@ -1054,8 +883,7 @@ async fn test_forward_upstream_unknown_protocol() {
 #[tokio::test]
 async fn test_concurrent_queries() {
     let resolver = Arc::new(full_mock_resolver());
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     // Fire 10 queries concurrently for different record types.
     let queries: Vec<(&str, RecordType)> = vec![
@@ -1065,8 +893,8 @@ async fn test_concurrent_queries() {
         ("example.com.", RecordType::NS),
         ("example.com.", RecordType::CNAME),
         ("example.com.", RecordType::SRV),
+        ("example.com.", RecordType::SOA),
         ("example.com.", RecordType::A),
-        ("example.com.", RecordType::MX),
         ("example-both.com.", RecordType::A),
         ("example-both.com.", RecordType::AAAA),
     ];
@@ -1102,8 +930,7 @@ async fn test_concurrent_queries() {
 #[tokio::test]
 async fn test_truncated_message() {
     let resolver = Arc::new(full_mock_resolver());
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     // Send garbage bytes that can't be parsed as a DNS message.
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1124,8 +951,7 @@ async fn test_truncated_message() {
 #[tokio::test]
 async fn test_oversized_question_section() {
     let resolver = Arc::new(full_mock_resolver());
-    let dead = dead_upstream_addr().await;
-    let (proxy_addr, handle) = start_proxy(resolver, &dead, false).await;
+    let (proxy_addr, handle) = start_proxy(resolver, false).await;
 
     // Build a message with multiple questions -- only the first should be used.
     let mut msg = Message::new();

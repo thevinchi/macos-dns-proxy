@@ -34,17 +34,13 @@ macos-dns-proxy (on macOS host)
     |       |-- VPN DNS servers (when connected, for VPN-specific domains)
     |       |-- /etc/resolver/* entries
     |
-    |-- CNAME, MX, TXT, SRV, NS, PTR queries:
-    |       |
-    |       v
-    |   res_query (libresolv FFI) -> system resolver
-    |       |
-    |       |-- Returns full DNS wire-format responses with real TTLs
-    |
-    |-- All other query types (SOA, CAA, etc.):
+    |-- All other query types (CNAME, MX, TXT, SRV, NS, PTR, SOA, CAA, ...):
             |
             v
-        Upstream DNS server (--upstream, default 127.0.0.1:53)
+        DNSServiceQueryRecord (dns_sd / mDNSResponder)
+            |
+            |-- Honors the same split-DNS config as getaddrinfo
+            |-- Returns full DNS records with real TTLs
 ```
 
 For A and AAAA queries, the proxy uses `getaddrinfo()` (via the `dns-lookup`
@@ -52,13 +48,15 @@ crate), which on macOS communicates with `mDNSResponder` via Mach IPC (not via
 port 53). This path **always** respects `scutil --dns` configuration, VPN
 split-DNS routing, and `/etc/resolver/*` files.
 
-For CNAME, MX, TXT, SRV, NS, and PTR queries, the proxy calls `res_query()`
-via libresolv FFI, which queries through the system's configured DNS resolver
-and returns full DNS wire-format responses with real TTLs.
+For every other query type, the proxy calls `DNSServiceQueryRecord()` from
+`dns_sd.h` (also part of `mDNSResponder`). Like `getaddrinfo`, it honors the
+system's split-DNS configuration, but supports arbitrary resource-record types
+and returns full records with their real TTLs.
 
-For less common query types (SOA, CAA, NAPTR, etc.) that aren't handled by the
-system resolver paths above, the proxy falls back to raw DNS forwarding to the
-`--upstream` server.
+> Earlier versions routed these types through `res_query()` (libresolv), which
+> bypasses `mDNSResponder`/split-DNS and collapsed every failure into a false
+> NXDOMAIN, and forwarded uncommon types to a `--upstream` server whose default
+> (`127.0.0.1:53`) was dead. Both of those paths have been removed.
 
 ## Requirements
 
@@ -104,7 +102,7 @@ make uninstall
 ## Standalone Usage
 
 ```
-macos-dns-proxy --listen <addr:port> [--upstream <addr:port>] [--verbose]
+macos-dns-proxy --listen <addr:port> [--verbose]
 ```
 
 ### Flags
@@ -112,7 +110,6 @@ macos-dns-proxy --listen <addr:port> [--upstream <addr:port>] [--verbose]
 | Flag | Default | Description |
 |---|---|---|
 | `--listen` | *(required)* | Address and port to listen on (e.g., `192.168.99.1:53`) |
-| `--upstream` | `127.0.0.1:53` | Upstream DNS server for unsupported query types (SOA, CAA, etc.) |
 | `--verbose` | `false` | Log each query name, type, resolution method, response code, and latency |
 
 ### Example
@@ -154,7 +151,7 @@ scutil --dns
 
 ## How It Works
 
-The proxy handles DNS queries in three ways depending on the record type:
+The proxy handles DNS queries in two ways depending on the record type:
 
 1. **getaddrinfo path** (A, AAAA):
    Uses `getaddrinfo()` via the `dns-lookup` crate. On macOS this communicates
@@ -164,18 +161,19 @@ The proxy handles DNS queries in three ways depending on the record type:
    anything listening on port 53. Since `getaddrinfo()` doesn't expose TTL
    information, a synthetic TTL of 60 seconds is used.
 
-2. **res_query path** (CNAME, MX, TXT, SRV, NS, PTR):
-   Uses `res_query()` via libresolv FFI, which queries through the system's
-   configured DNS resolver and returns full DNS wire-format responses. This
-   preserves real TTLs from the authoritative response.
-
-3. **Upstream fallback** (SOA, CAA, NAPTR, and other types):
-   Forwards the raw DNS message to the `--upstream` server.
+2. **DNSServiceQueryRecord path** (every other type: CNAME, MX, TXT, SRV, NS,
+   PTR, SOA, CAA, ...):
+   Uses `DNSServiceQueryRecord()` from `dns_sd.h` (mDNSResponder). It honors the
+   same split-DNS configuration as `getaddrinfo` and returns full records with
+   their real TTLs. Outcomes are mapped honestly: records present → NOERROR with
+   answers; name exists but no record of that type → NODATA (NOERROR, empty
+   answers); name does not exist → NXDOMAIN; timeout or other error → SERVFAIL
+   (so clients retry rather than caching a false "does not exist").
 
 Verbose mode logs which path was used for each query:
 ```
-query example.com. A from 192.168.99.10:12345 -> NOERROR [system] (1.234ms)
-query example.com. SOA from 192.168.99.10:12345 -> NOERROR [upstream] (2.345ms)
+query example.com. A   from 192.168.99.10:12345 -> NOERROR [getaddrinfo] (1.234ms)
+query example.com. SOA from 192.168.99.10:12345 -> NOERROR [dns-sd] (2.345ms)
 ```
 
 ## Tests
@@ -194,12 +192,10 @@ make test
 - **DNS-over-TCP**: Both UDP and TCP are supported. Truncated UDP responses
   that cause TCP retry will work correctly.
 - **TTLs**: The `getaddrinfo` path (A, AAAA) uses a synthetic TTL of 60 seconds
-  since `getaddrinfo()` doesn't expose TTL information. The `res_query` path
-  (CNAME, MX, TXT, SRV, NS, PTR) and the upstream fallback path both preserve
-  original TTLs.
+  since `getaddrinfo()` doesn't expose TTL information. The
+  `DNSServiceQueryRecord` path (all other types) preserves original TTLs.
 - **DNSSEC**: Not preserved through the `getaddrinfo` path (A, AAAA) since
-  `getaddrinfo` doesn't expose DNSSEC data. The `res_query` and upstream
-  fallback paths preserve DNSSEC transparently.
+  `getaddrinfo` doesn't expose DNSSEC data.
 - **macOS firewall**: If the application firewall is enabled, you may need to
   allow the `macos-dns-proxy` binary. The built-in `pf` firewall typically
   doesn't block loopback or vmnet traffic by default.

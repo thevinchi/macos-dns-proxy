@@ -22,10 +22,6 @@ struct Cli {
     #[arg(long)]
     listen: String,
 
-    /// Upstream DNS server for unsupported query types (e.g., SOA, CAA)
-    #[arg(long, default_value = "127.0.0.1:53")]
-    upstream: String,
-
     /// Log each DNS query
     #[arg(long, default_value_t = false)]
     verbose: bool,
@@ -37,24 +33,24 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let listen_addr = cli.listen.clone();
-    let upstream = Arc::new(cli.upstream.clone());
     let verbose = cli.verbose;
     let resolver = Arc::new(SystemResolver);
 
     let (udp_socket, tcp_listener) = wait_for_bind(&listen_addr).await?;
 
     tracing::info!("listening on {} (UDP and TCP)", listen_addr);
-    tracing::info!("using system resolver for A, AAAA, CNAME, MX, TXT, SRV, NS, PTR queries");
-    tracing::info!("fallback upstream {} for other query types", cli.upstream);
+    tracing::info!(
+        "A/AAAA via getaddrinfo, all other types via DNSServiceQueryRecord (mDNSResponder)"
+    );
 
     // Launch UDP and TCP servers concurrently, shut down on signal.
     tokio::select! {
-        result = run_udp_server(udp_socket, resolver.clone(), upstream.clone(), verbose) => {
+        result = run_udp_server(udp_socket, resolver.clone(), verbose) => {
             if let Err(e) = result {
                 tracing::error!("UDP server failed: {}", e);
             }
         },
-        result = run_tcp_server(tcp_listener, resolver.clone(), upstream.clone(), verbose) => {
+        result = run_tcp_server(tcp_listener, resolver.clone(), verbose) => {
             if let Err(e) = result {
                 tracing::error!("TCP server failed: {}", e);
             }
@@ -72,7 +68,6 @@ async fn main() -> Result<()> {
 async fn run_udp_server(
     socket: UdpSocket,
     resolver: Arc<SystemResolver>,
-    upstream: Arc<String>,
     verbose: bool,
 ) -> Result<()> {
     let socket = Arc::new(socket);
@@ -95,11 +90,8 @@ async fn run_udp_server(
         // Spawn a task to handle the request concurrently.
         let socket = socket.clone();
         let resolver = resolver.clone();
-        let upstream = upstream.clone();
         tokio::spawn(async move {
-            let response =
-                handler::handle_dns(&request, resolver.as_ref(), &upstream, "udp", src, verbose)
-                    .await;
+            let response = handler::handle_dns(&request, resolver.as_ref(), src, verbose).await;
 
             match response.to_vec() {
                 Ok(bytes) => {
@@ -119,16 +111,14 @@ async fn run_udp_server(
 async fn run_tcp_server(
     listener: TcpListener,
     resolver: Arc<SystemResolver>,
-    upstream: Arc<String>,
     verbose: bool,
 ) -> Result<()> {
     loop {
         let (stream, src) = listener.accept().await.context("TCP accept failed")?;
 
         let resolver = resolver.clone();
-        let upstream = upstream.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_tcp_connection(stream, src, resolver, upstream, verbose).await {
+            if let Err(e) = handle_tcp_connection(stream, src, resolver, verbose).await {
                 tracing::debug!("TCP connection from {} error: {}", src, e);
             }
         });
@@ -141,7 +131,6 @@ async fn handle_tcp_connection(
     mut stream: tokio::net::TcpStream,
     src: SocketAddr,
     resolver: Arc<SystemResolver>,
-    upstream: Arc<String>,
     verbose: bool,
 ) -> Result<()> {
     // Read 2-byte length prefix.
@@ -161,8 +150,7 @@ async fn handle_tcp_connection(
 
     let request = Message::from_vec(&msg_buf).context("failed to parse TCP DNS message")?;
 
-    let response =
-        handler::handle_dns(&request, resolver.as_ref(), &upstream, "tcp", src, verbose).await;
+    let response = handler::handle_dns(&request, resolver.as_ref(), src, verbose).await;
 
     let response_bytes = response
         .to_vec()
